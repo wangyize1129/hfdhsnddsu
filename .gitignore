@@ -159,15 +159,9 @@ cython_debug/
 #  option (not recommended) you can uncomment the following to ignore the entire idea folder.
 #.idea/
 
-# Subject data, experiment outputs, and pretrained weights
-/dataset/*
-!/dataset/scripts/
-!/dataset/LICENSE.txt
-/dataset/scripts/*.jpg
-/questionnaire_statements.json
+# Local environment and experiment outputs
+/dataset/.conda/
 /outputs/
-/model.safetensors
-/pretrained/biolord/*.safetensors
 
 # Local IDE remote deployment settings
 /.idea/deployment.xml
