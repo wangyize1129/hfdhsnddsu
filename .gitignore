@@ -172,3 +172,4 @@ cython_debug/
 # Local IDE remote deployment settings
 /.idea/deployment.xml
 /.idea/webServers.xml
+/read_paper/
