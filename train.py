@@ -1,4 +1,5 @@
 from pathlib import Path
+import argparse
 import sys
 import subprocess
 from types import SimpleNamespace
@@ -15,9 +16,7 @@ import warnings
 
 import numpy as np
 import torch
-from torch.nn import functional as F
 from torch.utils.data import DataLoader, Dataset
-from tqdm import tqdm
 from safetensors.torch import load_file
 from sklearn.metrics import (accuracy_score, balanced_accuracy_score, classification_report,
                              confusion_matrix, f1_score)
@@ -25,7 +24,7 @@ from sklearn.metrics import (accuracy_score, balanced_accuracy_score, classifica
 from momentfm import MOMENTPipeline
 from momentfm.data.pads_classification_dataset import PADS_dataset
 from reconstruction.model import (ReconstructionModel, QuestionnaireFusionHead,
-                                  reconstruction_loss, masked_reconstruction_loss, questionnaire_mask, load_cache, balanced_class_weights,
+                                  masked_reconstruction_loss, questionnaire_mask, load_cache, balanced_class_weights,
                                   weighted_classification_loss, movement_amplitude)
 
 
@@ -36,7 +35,7 @@ CONFIG = {
     "local_model_dir": str(ROOT),
     "statement_json": str(ROOT / "questionnaire_statements.json"),
     "text_cache": str(ROOT / "outputs" / "reconstruction_text" / "reconstruction_features.npz"),
-    "run_dir": str(ROOT / "outputs" / "questionnaire_amplitude_masked_mse"),
+    "run_dir": str(ROOT / "outputs" / "questionnaire_amplitude_moe_masked_mse"),
     "text_model": str(ROOT / "pretrained" / "biolord"),
     "reencode_text": False,
     "save_model": True,
@@ -44,9 +43,9 @@ CONFIG = {
     "text_batch_size": 32,
     "text_max_length": 128,
 
-    "epochs": 15,
+    "epochs": 20,
     "seq_len": 976,
-    "micro_batch_size": 16,
+    "micro_batch_size": 8,
     "effective_batch_size": 32,
     "num_workers": 0,
     "seed": 42,
@@ -56,6 +55,11 @@ CONFIG = {
     "reconstruction_weight": 0.01,
     "questionnaire_mask_ratio": 0.3,
     "use_amplitude_features": True,
+    "fusion_type": "moe",
+    "fusion_dim": 128,
+    "moe_num_experts": 4,
+    "moe_top_k": 2,
+    "moe_expert_hidden_dim": 256,
     "fusion_time_dim": 128,
     "fusion_question_dim": 32,
     "fusion_hidden_dim": 64,
@@ -81,7 +85,6 @@ CONFIG = {
     "decoder_norm_eps": 1e-5,
     "gradient_clip": 1.0,
     "torch_num_threads": 4,
-    "progress_update_batches": 10,
     "device": "auto",
     "precision": "auto",
     "gradient_checkpointing": True,
@@ -110,10 +113,7 @@ def emit(event, **values):
             f"Val macro-F1={val['macro_f1']:.4f} | "
             f"Val balanced accuracy={val['balanced_accuracy']:.2%}", flush=True)
         if "masked_mse_paired" in val:
-            print(f"Val masked MSE | Paired={val['masked_mse_paired']:.6f} | "
-                  f"Shuffled={val['masked_mse_shuffled']:.6f} | "
-                  f"Visible-only ablation={val['masked_mse_visible_only']:.6f} | "
-                  f"Train prior={val['masked_mse_train_prior']:.6f}", flush=True)
+            print(f"Val masked MSE={val['masked_mse_paired']:.6f}", flush=True)
     elif event == "training_complete":
         metrics = values["test"]
         macro = metrics["classification_report"]["macro avg"]
@@ -174,6 +174,8 @@ def amp_context(device, dtype):
 
 
 def make_model(args):
+    if getattr(args, "fusion_type", None) != "moe":
+        raise ValueError("This model requires a MoE configuration or checkpoint")
     from peft import LoraConfig, get_peft_model
     from momentfm.common import TASKS
 
@@ -211,7 +213,11 @@ def make_model(args):
         time_dim=args.fusion_time_dim, question_dim=args.fusion_question_dim,
         hidden_dim=args.fusion_hidden_dim, dropout=args.head_dropout,
         amplitude_mean=args.amplitude_mean if use_amplitude else None,
-        amplitude_std=args.amplitude_std if use_amplitude else None)
+        amplitude_std=args.amplitude_std if use_amplitude else None,
+        fusion_dim=getattr(args, "fusion_dim", 128),
+        moe_num_experts=getattr(args, "moe_num_experts", 4),
+        moe_top_k=getattr(args, "moe_top_k", 2),
+        moe_expert_hidden_dim=getattr(args, "moe_expert_hidden_dim", 256))
     model.moment.get_base_model().head.requires_grad_(False)
     model.masked_context = torch.nn.Sequential(
         torch.nn.Linear(60, model.d_model), torch.nn.GELU(),
@@ -230,7 +236,6 @@ def evaluate(model, loader, device, dtype, label_smoothing=0.0, class_weights=No
     labels, predictions, probabilities = [], [], []
     loss_sum = torch.zeros((), device=device, dtype=torch.float64)
     count = 0
-    pooled_features = []
     masked_features, masked_answers = [], []
     for batch in loader:
         x, y = batch[:2]
@@ -241,19 +246,12 @@ def evaluate(model, loader, device, dtype, label_smoothing=0.0, class_weights=No
         if masked_evaluation is not None:
             masked_features.append(features.float())
             masked_answers.append(questionnaire)
-        pooled_features.append(features.float().reshape(-1, model.d_model, model.n_channels).mean(-1))
         loss_sum += weighted_classification_loss(logits, y, class_weights,
                                                  label_smoothing, reduction="sum").detach()
         count += len(y)
         labels.append(y)
         predictions.append(logits.argmax(dim=-1))
         probabilities.append(logits.float().softmax(dim=-1))
-    pooled = torch.cat(pooled_features)
-    unit = F.normalize(pooled, dim=-1)
-    cosine = unit @ unit.T
-    off_diagonal = ~torch.eye(count, dtype=torch.bool, device=device)
-    statistics = torch.stack((loss_sum / count, pooled.var(0, unbiased=False).mean(),
-                              cosine[off_diagonal].mean() if count > 1 else pooled.new_zeros(()))).cpu().tolist()
     # Keep batch outputs on device; transfer once at the end for sklearn/JSON.
     outputs = torch.cat((torch.cat(labels)[:, None], torch.cat(predictions)[:, None],
                          torch.cat(probabilities)), dim=1).cpu()
@@ -267,20 +265,12 @@ def evaluate(model, loader, device, dtype, label_smoothing=0.0, class_weights=No
         mask = masked_evaluation["mask"]
         prototypes = masked_evaluation["prototypes"]
         target = prototypes[torch.arange(30, device=device)[None], actual.long()]
-        reconstruction_inputs = (
-            ("paired", features, True), ("shuffled", features.roll(1, 0), True),
-            ("visible_only", features, False))
-        for name, feature, motion in reconstruction_inputs:
-            pred = model.reconstruct(feature, conditions, actual, mask, use_motion=motion)
-            auxiliary_metrics["masked_mse_" + name] = masked_reconstruction_loss(pred, target, mask).item()
-        prior = masked_evaluation["prior"].expand_as(target)
-        auxiliary_metrics["masked_mse_train_prior"] = masked_reconstruction_loss(prior, target, mask).item()
+        pred = model.reconstruct(features, conditions, actual, mask)
+        auxiliary_metrics["masked_mse_paired"] = masked_reconstruction_loss(pred, target, mask).item()
         auxiliary_metrics["masked_question_count"] = int(mask.sum())
     return {
         **auxiliary_metrics,
-        "pooled_feature_variance": statistics[1],
-        "pooled_feature_mean_cosine": statistics[2] if count > 1 else None,
-        "classification_loss": statistics[0],
+        "classification_loss": (loss_sum / count).item(),
         "accuracy": accuracy_score(labels, predictions),
         "macro_f1": f1_score(labels, predictions, labels=[0, 1, 2], average="macro", zero_division=0),
         "balanced_accuracy": balanced_accuracy_score(labels, predictions),
@@ -343,8 +333,6 @@ def run(args):
     answers, conditions, prototypes = load_cache(args.text_cache, splits["train"])
     answers, conditions, prototypes = [t.to(device) for t in (answers, conditions, prototypes)]
     targets_bank = prototypes[torch.arange(30, device=device)[None], answers]
-    prior = targets_bank.mean(0, keepdim=True)
-    prior_mse = reconstruction_loss(prior.expand_as(targets_bank), targets_bank).item()
     auxiliary_enabled = args.reconstruction_weight != 0
     generator = torch.Generator().manual_seed(args.seed)
     train_loader = DataLoader(IndexedDataset(datasets["train"]), batch_size=args.micro_batch_size,
@@ -360,7 +348,7 @@ def run(args):
     for index, phase in enumerate(("val", "test")):
         mask = questionnaire_mask(len(splits[phase]), args.questionnaire_mask_ratio,
                                   torch.Generator().manual_seed(args.seed + 211 + index), device)
-        masked_evaluations[phase] = {"mask": mask, "prototypes": prototypes, "prior": prior}
+        masked_evaluations[phase] = {"mask": mask, "prototypes": prototypes}
         write_json(run_dir / (phase + "_questionnaire_masks.json"),
                    {"subject_ids": splits[phase], "mask": mask.cpu().tolist()})
     model = make_model(args).to(device)
@@ -395,7 +383,6 @@ def run(args):
         "reconstruction_input": "movement_and_visible_answers",
         "reconstruction_backprop": auxiliary_enabled,
         "text_encoder_loaded_in_training": False,
-        "reconstruction_train_mean_baseline": prior_mse,
         "time_reconstruction_pooling": "mean of patches and channels; classifier retains concat",
         "precision": str(dtype) if device.type == "cuda" else "float32",
         "reconstruction_precision": "float32 decoder and MSE outside autocast",
@@ -424,56 +411,50 @@ def run(args):
         question_counts = torch.zeros(30, device=device)
         count = 0
         correct = torch.zeros((), dtype=torch.int64, device=device)
-        with tqdm(train_loader, total=len(train_loader), desc=f"Epoch {epoch}/{args.epochs}",
-                  unit="batch", dynamic_ncols=True, file=sys.stdout) as progress:
-            for step, (x, y, targets) in enumerate(progress):
-                x = x.to(device, non_blocking=True).float()
-                y = y.to(device, non_blocking=True)
-                targets = targets.to(device, non_blocking=True)
-                with amp_context(device, dtype):
-                    logits, features = model(x, answers[targets])
-                    cls_loss = weighted_classification_loss(logits, y, class_weights, args.label_smoothing)
-                # Backpropagate through the decoder when either auxiliary objective is enabled.
-                with torch.set_grad_enabled(auxiliary_enabled):
-                    mask = questionnaire_mask(len(y), args.questionnaire_mask_ratio, mask_generator, device)
-                    reconstruction = model.reconstruct(features, conditions, answers[targets], mask)
-                    reconstruction_target = targets_bank[targets]
-                    auxiliary_loss = masked_reconstruction_loss(reconstruction, reconstruction_target, mask)
-                loss = cls_loss
-                if args.reconstruction_weight != 0:
-                    loss = loss + args.reconstruction_weight * auxiliary_loss
-                with torch.no_grad():
-                    distances = (reconstruction[:, :, None] - prototypes[None]).square().sum(-1)
-                    matches = (distances.argmin(-1) == answers[targets]) & mask
-                    polarity_correct += matches.sum()
-                    question_correct += matches.sum(0)
-                    question_counts += mask.sum(0)
-                    predicted_counts += torch.bincount(logits.argmax(-1), minlength=3)
-                if not torch.isfinite(loss):
-                    raise RuntimeError(f"Non-finite loss at epoch {epoch}, step {step}")
-                # Weight by subjects, including the last short microbatch/window.
-                window_start = (step // accumulation) * accumulation
-                subjects_in_window = min(args.effective_batch_size,
-                                         len(datasets["train"]) - window_start * args.micro_batch_size)
-                scaler.scale(loss * len(y) / subjects_in_window).backward()
-                if (step + 1) % accumulation == 0 or step + 1 == len(train_loader):
-                    scaler.unscale_(optimizer)
-                    gradient_norm = torch.nn.utils.clip_grad_norm_(trainable_parameters, args.gradient_clip)
-                    if not torch.isfinite(gradient_norm):
-                        raise RuntimeError("Non-finite gradient norm")
-                    scaler.step(optimizer)
-                    scaler.update()
-                    scheduler.step()
-                    optimizer.zero_grad(set_to_none=True)
-                batch_count = len(y)
-                totals += torch.stack((loss.detach(), cls_loss.detach(), auxiliary_loss.detach())).double() * batch_count
-                count += batch_count
-                correct += (logits.argmax(dim=-1) == y).sum()
-                if (step + 1) % args.progress_update_batches == 0 or step + 1 == len(train_loader):
-                    display = torch.cat((totals / count, (correct / count).reshape(1))).cpu().tolist()
-                    progress.set_postfix(loss=f"{display[0]:.6f}", CE=f"{display[1]:.6f}",
-                                         MSE=f"{display[2]:.6f}", accuracy=f"{display[3]:.2%}", refresh=False)
-                del logits, features, reconstruction, reconstruction_target, distances, loss, cls_loss, auxiliary_loss, x, y, targets
+        for step, (x, y, targets) in enumerate(train_loader):
+            x = x.to(device, non_blocking=True).float()
+            y = y.to(device, non_blocking=True)
+            targets = targets.to(device, non_blocking=True)
+            with amp_context(device, dtype):
+                logits, features = model(x, answers[targets])
+                cls_loss = weighted_classification_loss(logits, y, class_weights, args.label_smoothing)
+            # Backpropagate through the decoder when either auxiliary objective is enabled.
+            with torch.set_grad_enabled(auxiliary_enabled):
+                mask = questionnaire_mask(len(y), args.questionnaire_mask_ratio, mask_generator, device)
+                reconstruction = model.reconstruct(features, conditions, answers[targets], mask)
+                reconstruction_target = targets_bank[targets]
+                auxiliary_loss = masked_reconstruction_loss(reconstruction, reconstruction_target, mask)
+            loss = cls_loss
+            if args.reconstruction_weight != 0:
+                loss = loss + args.reconstruction_weight * auxiliary_loss
+            with torch.no_grad():
+                distances = (reconstruction[:, :, None] - prototypes[None]).square().sum(-1)
+                matches = (distances.argmin(-1) == answers[targets]) & mask
+                polarity_correct += matches.sum()
+                question_correct += matches.sum(0)
+                question_counts += mask.sum(0)
+                predicted_counts += torch.bincount(logits.argmax(-1), minlength=3)
+            if not torch.isfinite(loss):
+                raise RuntimeError(f"Non-finite loss at epoch {epoch}, step {step}")
+            # Weight by subjects, including the last short microbatch/window.
+            window_start = (step // accumulation) * accumulation
+            subjects_in_window = min(args.effective_batch_size,
+                                     len(datasets["train"]) - window_start * args.micro_batch_size)
+            scaler.scale(loss * len(y) / subjects_in_window).backward()
+            if (step + 1) % accumulation == 0 or step + 1 == len(train_loader):
+                scaler.unscale_(optimizer)
+                gradient_norm = torch.nn.utils.clip_grad_norm_(trainable_parameters, args.gradient_clip)
+                if not torch.isfinite(gradient_norm):
+                    raise RuntimeError("Non-finite gradient norm")
+                scaler.step(optimizer)
+                scaler.update()
+                scheduler.step()
+                optimizer.zero_grad(set_to_none=True)
+            batch_count = len(y)
+            totals += torch.stack((loss.detach(), cls_loss.detach(), auxiliary_loss.detach())).double() * batch_count
+            count += batch_count
+            correct += (logits.argmax(dim=-1) == y).sum()
+            del logits, features, reconstruction, reconstruction_target, distances, loss, cls_loss, auxiliary_loss, x, y, targets
         # One compact transfer of detached epoch statistics, with no retained graph.
         summary = torch.cat((totals, correct.reshape(1), polarity_correct.reshape(1),
                              predicted_counts, question_correct)).cpu().tolist()
@@ -559,11 +540,15 @@ def prepare_text_cache(args):
 
 
 def main():
+    parser = argparse.ArgumentParser(description="Train movement/questionnaire fusion")
+    parser.add_argument("--run-dir", default=CONFIG["run_dir"])
+    overrides = parser.parse_args()
     args = SimpleNamespace(**CONFIG)
+    args.run_dir = overrides.run_dir
+    if not 1 <= args.moe_top_k <= args.moe_num_experts or args.moe_expert_hidden_dim <= 0:
+        raise ValueError("Require 1 <= moe_top_k <= moe_num_experts and positive moe_expert_hidden_dim")
     if not math.isfinite(args.questionnaire_mask_ratio) or not 0 < args.questionnaire_mask_ratio < 1:
         raise ValueError("questionnaire_mask_ratio must be between zero and one")
-    if args.progress_update_batches <= 0:
-        raise ValueError("progress_update_batches must be positive")
     if args.epochs <= 0 or args.num_workers < 0 or args.text_batch_size <= 0 or args.text_max_length <= 0:
         raise ValueError("epochs and text encoding sizes must be positive; num_workers must be nonnegative")
     if not (0 < args.val_ratio < 1 and 0 < args.test_ratio < 1 and args.val_ratio + args.test_ratio < 1):
@@ -571,7 +556,8 @@ def main():
     if any(value <= 0 for value in (args.lora_lr, args.head_lr, args.decoder_lr, args.adam_eps,
                                     args.gradient_clip, args.decoder_hidden_dim, args.decoder_norm_eps,
                                     args.lora_r, args.lora_alpha, args.torch_num_threads, args.head_channel_dim,
-                                    args.fusion_time_dim, args.fusion_question_dim, args.fusion_hidden_dim)):
+                                    args.fusion_time_dim, args.fusion_question_dim, args.fusion_hidden_dim,
+                                    args.fusion_dim)):
         raise ValueError("learning rates, dimensions, epsilons and gradient clip must be positive")
     if len(args.adam_betas) != 2 or any(not 0 <= value < 1 for value in args.adam_betas):
         raise ValueError("Adam betas must contain two values in [0, 1)")

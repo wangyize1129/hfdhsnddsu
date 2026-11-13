@@ -22,11 +22,6 @@ def load_cache(path, subject_ids):
     return torch.from_numpy(answers).long(), torch.from_numpy(conditions).float(), torch.from_numpy(targets).float()
 
 
-def reconstruction_loss(prediction, target):
-    # Sum feature dimensions; average subjects and questions.
-    return (prediction.float()-target.float()).square().sum(-1).mean()
-
-
 def questionnaire_mask(batch_size, ratio, generator, device):
     """Hide an exact number of answers per subject using a separate CPU RNG."""
     count = max(1, min(29, round(30 * ratio)))
@@ -69,12 +64,57 @@ def movement_amplitude(x):
     return (variance.sum(dim=-1).sqrt() + 1e-6).log().flatten(1)
 
 
+class MoEExpert(nn.Module):
+    """Bias-free SiLU gated FFN used by MedTVL's official experts."""
+    def __init__(self, input_dim, hidden_dim, output_dim):
+        super().__init__()
+        self.gate_proj = nn.Linear(input_dim, hidden_dim, bias=False)
+        self.up_proj = nn.Linear(input_dim, hidden_dim, bias=False)
+        self.down_proj = nn.Linear(hidden_dim, output_dim, bias=False)
+        self.activation = nn.SiLU()
+
+    def forward(self, features):
+        return self.down_proj(self.activation(self.gate_proj(features)) * self.up_proj(features))
+
+
+class MoEFusion(nn.Module):
+    """MedTVL Eq. (5), with one shared FFN and sparse top-k routed FFNs."""
+    def __init__(self, fusion_dim, num_experts=4, top_k=2, expert_hidden_dim=256):
+        super().__init__()
+        if not 1 <= top_k <= num_experts or expert_hidden_dim <= 0:
+            raise ValueError('Require 1 <= top_k <= num_experts and positive expert_hidden_dim')
+        self.top_k = top_k
+        joint_dim = 2 * fusion_dim
+        self.shared_expert = MoEExpert(joint_dim, expert_hidden_dim, fusion_dim)
+        self.experts = nn.ModuleList([
+            MoEExpert(joint_dim, expert_hidden_dim, fusion_dim)
+            for _ in range(num_experts)])
+        self.shared_gate = nn.Linear(joint_dim, 1, bias=False)
+        self.router = nn.Linear(joint_dim, num_experts, bias=False)
+
+    def forward(self, joint):
+        fused = torch.sigmoid(self.shared_gate(joint)) * self.shared_expert(joint)
+        # Select probabilities from the full softmax, as in Eq. (5).
+        weights, indices = self.router(joint).float().softmax(-1).topk(self.top_k, dim=-1)
+        for expert_index, expert in enumerate(self.experts):
+            subjects, slots = torch.where(indices == expert_index)
+            if subjects.numel():
+                output = expert(joint[subjects])
+                contribution = weights[subjects, slots, None].to(output.dtype) * output
+                fused = fused.index_add(0, subjects, contribution)
+        return fused
+
+
 class QuestionnaireFusionHead(nn.Module):
-    """Retain channel identities and combine movement with 30 real answers."""
+    """Fuse movement and questionnaire representations with sparse MoE."""
     def __init__(self, d_model, n_channels, channel_dim=16, time_dim=128,
                  question_dim=32, hidden_dim=64, dropout=0.3,
-                 amplitude_mean=None, amplitude_std=None):
+                 amplitude_mean=None, amplitude_std=None,
+                 fusion_dim=128, moe_num_experts=4, moe_top_k=2,
+                 moe_expert_hidden_dim=256):
         super().__init__()
+        if fusion_dim <= 0:
+            raise ValueError('fusion_dim must be positive')
         self.d_model, self.n_channels = d_model, n_channels
         self.uses_amplitude = amplitude_mean is not None
         if (amplitude_mean is None) != (amplitude_std is None):
@@ -96,8 +136,15 @@ class QuestionnaireFusionHead(nn.Module):
         self.question_projection = nn.Sequential(
             nn.Linear(30, question_dim),
             nn.GELU(), nn.LayerNorm(question_dim), nn.Dropout(dropout))
+        movement_dim = time_dim + (44 if self.uses_amplitude else 0)
+        self.movement_fusion_projection = nn.Sequential(
+            nn.Linear(movement_dim, fusion_dim), nn.GELU(), nn.LayerNorm(fusion_dim))
+        self.question_fusion_projection = nn.Sequential(
+            nn.Linear(question_dim, fusion_dim), nn.GELU(), nn.LayerNorm(fusion_dim))
+        self.moe = MoEFusion(fusion_dim, moe_num_experts, moe_top_k,
+                             moe_expert_hidden_dim)
         self.classifier = nn.Sequential(
-            nn.Linear(time_dim + question_dim + (44 if self.uses_amplitude else 0), hidden_dim), nn.GELU(),
+            nn.Linear(fusion_dim, hidden_dim), nn.GELU(),
             nn.Dropout(dropout), nn.Linear(hidden_dim, 3))
 
     def forward(self, features, answers, amplitude=None):
@@ -112,8 +159,11 @@ class QuestionnaireFusionHead(nn.Module):
             if amplitude is None or amplitude.shape != (features.shape[0], 44):
                 raise ValueError('Expected 44 amplitude features per subject')
             scaled = (amplitude.float() - self.amplitude_mean) / self.amplitude_std
-            return self.classifier(torch.cat((time, question, scaled), dim=-1))
-        return self.classifier(torch.cat((time, question), dim=-1))
+            time = torch.cat((time, scaled), dim=-1)
+        movement = self.movement_fusion_projection(time)
+        question = self.question_fusion_projection(question)
+        joint = torch.cat((movement, question), dim=-1)
+        return self.classifier(self.moe(joint))
 
 
 class ReconstructionModel(nn.Module):
@@ -133,14 +183,13 @@ class ReconstructionModel(nn.Module):
         output = self.moment(x_enc=x, reduction='concat')
         return output.logits, output.embeddings.mean(1)
 
-    def reconstruct(self, features, conditions, answers, mask, use_motion=True):
+    def reconstruct(self, features, conditions, answers, mask):
         if answers.shape != mask.shape or mask.dtype != torch.bool:
             raise ValueError('Expected aligned answers and a boolean mask')
         visible = torch.where(mask, 0.0, answers.float())
         context = self.masked_context(torch.cat((visible, (~mask).float()), dim=-1))
-        if use_motion:
-            time = self.time_norm(features.float().reshape(-1, self.d_model, self.n_channels).mean(-1))
-            context = context + time
+        time = self.time_norm(features.float().reshape(-1, self.d_model, self.n_channels).mean(-1))
+        context = context + time
         question = self.question_norm(conditions.float())
         batch, questions = context.shape[0], question.shape[0]
         decoder_input = torch.cat((context[:, None].expand(-1, questions, -1),
